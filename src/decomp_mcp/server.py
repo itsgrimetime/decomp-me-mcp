@@ -287,6 +287,36 @@ async def list_tools() -> list[Tool]:
                 "required": ["url_or_slug", "source_code"],
             },
         ),
+        Tool(
+            name="decomp_create_scratch",
+            description=(
+                "Create a new scratch on decomp.me for a function. Provide the function name and "
+                "target assembly. The scratch will be created with the Melee preset (mwcc_233_163n compiler). "
+                "Returns the new scratch slug which can be used for compilation and updates."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the function (e.g., 'fn_80393C14')",
+                    },
+                    "target_asm": {
+                        "type": "string",
+                        "description": "The target PowerPC assembly code to match against",
+                    },
+                    "source_code": {
+                        "type": "string",
+                        "description": "Initial source code (optional, defaults to placeholder comment)",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Context/headers for compilation (optional, fetched from reference scratch if not provided)",
+                    },
+                },
+                "required": ["name", "target_asm"],
+            },
+        ),
     ]
 
 
@@ -326,6 +356,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return await handle_search_context(client, arguments)
             elif name == "decomp_update_scratch":
                 return await handle_update_scratch(client, arguments)
+            elif name == "decomp_create_scratch":
+                return await handle_create_scratch(client, arguments)
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -729,6 +761,67 @@ async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, 
             f"",
             f"**Current Match:** {match_pct:.1f}%",
         ])
+
+    return [
+        TextContent(
+            type="text",
+            text="\n".join(lines),
+        )
+    ]
+
+
+async def handle_create_scratch(client: httpx.AsyncClient, arguments: dict[str, Any]) -> list[TextContent]:
+    """Handle decomp_create_scratch tool."""
+    name = arguments["name"]
+    target_asm = arguments["target_asm"]
+    source_code = arguments.get("source_code", "// TODO: Decompile this function\n")
+    context = arguments.get("context")
+
+    logger.info(f"Creating scratch: {name}")
+
+    # If no context provided, fetch from a reference Melee scratch
+    if not context:
+        logger.info("Fetching context from reference scratch TnPVM")
+        try:
+            ref_response = await client.get(f"{DECOMP_API_BASE}/scratch/TnPVM")
+            ref_response.raise_for_status()
+            ref_scratch = ref_response.json()
+            context = ref_scratch.get("context", "")
+        except Exception as e:
+            logger.warning(f"Could not fetch reference context: {e}")
+            context = ""
+
+    # Create the scratch
+    payload = {
+        "name": name,
+        "target_asm": target_asm,
+        "context": context,
+        "compiler": "mwcc_233_163n",
+        "compiler_flags": "-O4,p -nodefaults -fp hard -Cpp_exceptions off -enum int -fp_contract on -inline auto",
+        "source_code": source_code,
+        "diff_label": name,
+    }
+
+    response = await client.post(
+        f"{DECOMP_API_BASE}/scratch",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    response.raise_for_status()
+
+    result = response.json()
+    slug = result.get("slug", "unknown")
+
+    # Format the response
+    lines = [
+        f"# Scratch Created",
+        f"",
+        f"**Name:** {name}",
+        f"**Slug:** {slug}",
+        f"**URL:** {DECOMP_API_BASE.replace('/api', '')}/scratch/{slug}",
+        f"",
+        f"The scratch is ready for compilation. Use `decomp_compile` with slug `{slug}` to test your code.",
+    ]
 
     return [
         TextContent(
