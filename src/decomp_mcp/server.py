@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 from urllib.parse import urlparse
 
@@ -19,8 +20,12 @@ from mcp.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("decomp-mcp")
 
-# Base API URL
-DECOMP_API_BASE = "https://decomp.me/api"
+# Base API URL - can be overridden via environment variable
+DECOMP_API_BASE = os.environ.get("DECOMP_API_BASE", "https://decomp.me/api")
+
+# Cloudflare clearance and session cookies for public API access
+CF_CLEARANCE = os.environ.get("CF_CLEARANCE", "") or "TuhG_e5O_SNg0u7gB3.WowMJp8WODm7AWnBvQra9mew-1766425348-1.2.1.1-whMulmtdFo0QkR1_o6ehURXoQrKQWY247ovfu3_Ta3zAcFzYowfrOwxRaV9fZXGfZiSdB8o07bMQ9eitcQIVn2Mpvk7z6Z8rkFOgOi247yENLAdf2Swq2m2cu1qzRREsmE6hXNJhDRIwQ3d9f8WIZ4nJV7GRCyQ1DcJPCzNafAl8K4bVKuLFIX9iM074xW3wjF.qJd7OyDI3H8jk7IwyyREpIduJCRm2DLNNpMkBY1k"
+SESSION_ID = os.environ.get("DECOMP_SESSION_ID", "") or "1b80qta9in20bb8bt2hklgwzgd5dn56s"
 
 # Create server instance
 app = Server("decomp-mcp-server")
@@ -260,14 +265,55 @@ async def list_tools() -> list[Tool]:
                 "required": ["url_or_slug", "pattern"],
             },
         ),
+        Tool(
+            name="decomp_update_scratch",
+            description=(
+                "Update a scratch on decomp.me with new source code. Use this to save your progress "
+                "after improving the match score. The updated source code will be visible on the "
+                "decomp.me web UI and preserved for future work."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url_or_slug": {
+                        "type": "string",
+                        "description": "The decomp.me scratch URL or slug to update",
+                    },
+                    "source_code": {
+                        "type": "string",
+                        "description": "The new source code to save to the scratch",
+                    },
+                },
+                "required": ["url_or_slug", "source_code"],
+            },
+        ),
     ]
+
+
+def get_client_cookies() -> dict[str, str]:
+    """Get cookies for API requests."""
+    cookies = {}
+    if CF_CLEARANCE:
+        cookies["cf_clearance"] = CF_CLEARANCE
+    if SESSION_ID:
+        cookies["sessionid"] = SESSION_ID
+    return cookies
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: Any) -> list[TextContent]:
     """Handle tool calls."""
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        cookies = get_client_cookies()
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:146.0) Gecko/20100101 Firefox/146.0",
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+        async with httpx.AsyncClient(timeout=30.0, cookies=cookies, headers=headers) as client:
             if name == "decomp_get_scratch":
                 return await handle_get_scratch(client, arguments)
             elif name == "decomp_compile":
@@ -278,6 +324,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return await handle_search(client, arguments)
             elif name == "decomp_search_context":
                 return await handle_search_context(client, arguments)
+            elif name == "decomp_update_scratch":
+                return await handle_update_scratch(client, arguments)
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -638,6 +686,54 @@ async def handle_search_context(client: httpx.AsyncClient, arguments: dict[str, 
         TextContent(
             type="text",
             text="\n".join(output_lines),
+        )
+    ]
+
+
+async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, Any]) -> list[TextContent]:
+    """Handle decomp_update_scratch tool."""
+    url_or_slug = arguments["url_or_slug"]
+    slug = extract_slug_from_url(url_or_slug)
+    source_code = arguments["source_code"]
+
+    logger.info(f"Updating scratch: {slug}")
+
+    # PATCH the scratch with new source code
+    payload = {"source_code": source_code}
+
+    response = await client.patch(
+        f"{DECOMP_API_BASE}/scratch/{slug}",
+        json=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    response.raise_for_status()
+
+    result = response.json()
+
+    # Format the response
+    lines = [
+        f"# Scratch Updated",
+        f"",
+        f"**Slug:** {slug}",
+        f"**URL:** https://decomp.me/scratch/{slug}",
+        f"",
+        f"Source code has been saved to decomp.me.",
+    ]
+
+    # If the response includes score info, show it
+    if "score" in result:
+        score = result.get("score", 0)
+        max_score = result.get("max_score", 1)
+        match_pct = ((max_score - score) / max_score * 100) if max_score > 0 else 0
+        lines.extend([
+            f"",
+            f"**Current Match:** {match_pct:.1f}%",
+        ])
+
+    return [
+        TextContent(
+            type="text",
+            text="\n".join(lines),
         )
     ]
 
