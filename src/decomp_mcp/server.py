@@ -32,6 +32,9 @@ DECOMP_CONTEXT_FILE = os.environ.get("DECOMP_CONTEXT_FILE", "")
 # Path to claims file for coordinating parallel agents
 DECOMP_CLAIMS_FILE = os.environ.get("DECOMP_CLAIMS_FILE", "/tmp/decomp_claims.json")
 
+# Path to scratch tokens file (for updating scratches we created)
+DECOMP_SCRATCH_TOKENS_FILE = os.environ.get("DECOMP_SCRATCH_TOKENS_FILE", "/tmp/decomp_scratch_tokens.json")
+
 # Claim timeout in seconds (auto-release stale claims)
 DECOMP_CLAIM_TIMEOUT = int(os.environ.get("DECOMP_CLAIM_TIMEOUT", "3600"))  # 1 hour default
 
@@ -798,15 +801,35 @@ async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, 
 
     logger.info(f"Updating scratch: {slug}")
 
+    # Check if we have a claim token for this scratch
+    claim_token = _get_scratch_token(slug)
+
     # PATCH the scratch with new source code
     payload = {"source_code": source_code}
 
-    response = await client.patch(
-        f"{DECOMP_API_BASE}/scratch/{slug}",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    response.raise_for_status()
+    # Add claim token as cookie if we have one
+    cookies = {}
+    if claim_token:
+        cookies[f"scratch_{slug}"] = claim_token
+        logger.info(f"Using claim token for scratch {slug}")
+
+    try:
+        response = await client.patch(
+            f"{DECOMP_API_BASE}/scratch/{slug}",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            cookies=cookies,
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 403:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"❌ **Update Failed (403 Forbidden)**\n\nCannot update scratch `{slug}` - you don't own it.\n\n**Solution:** Create a new scratch using `decomp_create_scratch` instead. New scratches you create can be updated.",
+                )
+            ]
+        raise
 
     result = response.json()
 
@@ -891,6 +914,12 @@ async def handle_create_scratch(client: httpx.AsyncClient, arguments: dict[str, 
     result = response.json()
     slug = result.get("slug", "unknown")
 
+    # Save the claim token so we can update this scratch later
+    claim_token = result.get("claim_token")
+    if claim_token:
+        _save_scratch_token(slug, claim_token)
+        logger.info(f"Saved claim token for scratch {slug}")
+
     # Format the response
     lines = [
         f"# Scratch Created",
@@ -908,6 +937,38 @@ async def handle_create_scratch(client: httpx.AsyncClient, arguments: dict[str, 
             text="\n".join(lines),
         )
     ]
+
+
+def _load_scratch_tokens() -> dict[str, str]:
+    """Load scratch claim tokens from file."""
+    tokens_path = Path(DECOMP_SCRATCH_TOKENS_FILE)
+
+    if not tokens_path.exists():
+        return {}
+
+    try:
+        with open(tokens_path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_scratch_token(slug: str, token: str) -> None:
+    """Save a scratch claim token."""
+    tokens_path = Path(DECOMP_SCRATCH_TOKENS_FILE)
+    tokens_path.parent.mkdir(parents=True, exist_ok=True)
+
+    tokens = _load_scratch_tokens()
+    tokens[slug] = token
+
+    with open(tokens_path, 'w') as f:
+        json.dump(tokens, f, indent=2)
+
+
+def _get_scratch_token(slug: str) -> str | None:
+    """Get a scratch claim token if we have one."""
+    tokens = _load_scratch_tokens()
+    return tokens.get(slug)
 
 
 def _load_claims() -> dict[str, Any]:
