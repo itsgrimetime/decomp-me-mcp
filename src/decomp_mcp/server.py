@@ -35,6 +35,9 @@ DECOMP_CLAIMS_FILE = os.environ.get("DECOMP_CLAIMS_FILE", "/tmp/decomp_claims.js
 # Path to scratch tokens file (for updating scratches we created)
 DECOMP_SCRATCH_TOKENS_FILE = os.environ.get("DECOMP_SCRATCH_TOKENS_FILE", "/tmp/decomp_scratch_tokens.json")
 
+# Path to completed functions file (persistent record of worked-on functions)
+DECOMP_COMPLETED_FILE = os.environ.get("DECOMP_COMPLETED_FILE", "/tmp/decomp_completed.json")
+
 # Claim timeout in seconds (auto-release stale claims)
 DECOMP_CLAIM_TIMEOUT = int(os.environ.get("DECOMP_CLAIM_TIMEOUT", "3600"))  # 1 hour default
 
@@ -382,6 +385,57 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
             },
         ),
+        Tool(
+            name="decomp_complete_function",
+            description=(
+                "Mark a function as completed/attempted. Call this when done working on a function "
+                "(whether 100% match or stuck at 95%+). This prevents other agents from picking it up. "
+                "Also automatically releases the claim."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "function_name": {
+                        "type": "string",
+                        "description": "Name of the function",
+                    },
+                    "match_percent": {
+                        "type": "number",
+                        "description": "Best match percentage achieved (0-100)",
+                    },
+                    "scratch_slug": {
+                        "type": "string",
+                        "description": "The decomp.me scratch slug with the best code",
+                    },
+                    "committed": {
+                        "type": "boolean",
+                        "description": "Whether the code was committed to the repo",
+                        "default": False,
+                    },
+                    "notes": {
+                        "type": "string",
+                        "description": "Optional notes (e.g., 'register diffs only', 'needs struct work')",
+                    },
+                },
+                "required": ["function_name", "match_percent", "scratch_slug"],
+            },
+        ),
+        Tool(
+            name="decomp_list_completed",
+            description=(
+                "List all completed/attempted functions. Shows match percentages, scratch slugs, "
+                "and whether they were committed to the repo."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "min_match": {
+                        "type": "number",
+                        "description": "Only show functions with at least this match % (default: 0)",
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -429,6 +483,10 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 return await handle_release_function(arguments)
             elif name == "decomp_list_claims":
                 return await handle_list_claims(arguments)
+            elif name == "decomp_complete_function":
+                return await handle_complete_function(arguments)
+            elif name == "decomp_list_completed":
+                return await handle_list_completed(arguments)
             else:
                 return [TextContent(type="text", text=f"Unknown tool: {name}")]
     except Exception as e:
@@ -803,6 +861,11 @@ async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, 
 
     # Check if we have a claim token for this scratch
     claim_token = _get_scratch_token(slug)
+    logger.info(f"Loaded claim token for {slug}: {claim_token[:20] if claim_token else 'None'}...")
+
+    # Log all saved tokens for debugging
+    all_tokens = _load_scratch_tokens()
+    logger.info(f"All saved scratch tokens: {list(all_tokens.keys())}")
 
     # PATCH the scratch with new source code
     payload = {"source_code": source_code}
@@ -811,7 +874,7 @@ async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, 
     cookies = {}
     if claim_token:
         cookies[f"scratch_{slug}"] = claim_token
-        logger.info(f"Using claim token for scratch {slug}")
+        logger.info(f"Adding cookie scratch_{slug} for update")
 
     try:
         response = await client.patch(
@@ -914,11 +977,17 @@ async def handle_create_scratch(client: httpx.AsyncClient, arguments: dict[str, 
     result = response.json()
     slug = result.get("slug", "unknown")
 
+    # Log the full response for debugging
+    logger.info(f"Create scratch response keys: {list(result.keys())}")
+
     # Save the claim token so we can update this scratch later
-    claim_token = result.get("claim_token")
+    # decomp.me may return it as "claim_token" or include it in headers
+    claim_token = result.get("claim_token") or result.get("token")
     if claim_token:
         _save_scratch_token(slug, claim_token)
-        logger.info(f"Saved claim token for scratch {slug}")
+        logger.info(f"Saved claim token for scratch {slug}: {claim_token[:20]}...")
+    else:
+        logger.warning(f"No claim token in response for scratch {slug}")
 
     # Format the response
     lines = [
@@ -971,6 +1040,35 @@ def _get_scratch_token(slug: str) -> str | None:
     return tokens.get(slug)
 
 
+def _load_completed() -> dict[str, Any]:
+    """Load completed functions from file."""
+    completed_path = Path(DECOMP_COMPLETED_FILE)
+
+    if not completed_path.exists():
+        return {}
+
+    try:
+        with open(completed_path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_completed(completed: dict[str, Any]) -> None:
+    """Save completed functions to file."""
+    completed_path = Path(DECOMP_COMPLETED_FILE)
+    completed_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(completed_path, 'w') as f:
+        json.dump(completed, f, indent=2)
+
+
+def _is_function_completed(function_name: str) -> dict[str, Any] | None:
+    """Check if a function is already completed. Returns info if so, None otherwise."""
+    completed = _load_completed()
+    return completed.get(function_name)
+
+
 def _load_claims() -> dict[str, Any]:
     """Load claims from file, removing stale entries."""
     claims_path = Path(DECOMP_CLAIMS_FILE)
@@ -1009,6 +1107,19 @@ async def handle_claim_function(arguments: dict[str, Any]) -> list[TextContent]:
     agent_id = arguments.get("agent_id", "unknown")
 
     logger.info(f"Claiming function: {function_name} (agent: {agent_id})")
+
+    # Check if function is already completed (before locking)
+    completed_info = _is_function_completed(function_name)
+    if completed_info:
+        match_pct = completed_info.get("match_percent", 0)
+        scratch = completed_info.get("scratch_slug", "?")
+        committed = "committed" if completed_info.get("committed") else "not committed"
+        return [
+            TextContent(
+                type="text",
+                text=f"❌ **Claim Failed**\n\n`{function_name}` was already completed:\n- Match: {match_pct:.1f}%\n- Scratch: {scratch}\n- Status: {committed}\n\nPick a different function.",
+            )
+        ]
 
     claims_path = Path(DECOMP_CLAIMS_FILE)
     claims_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1120,6 +1231,126 @@ async def handle_list_claims(arguments: dict[str, Any]) -> list[TextContent]:
         lines.append(f"- **{func_name}** - claimed by `{claim_info.get('agent_id', 'unknown')}` ({age_mins:.0f}m ago, {remaining_mins:.0f}m remaining)")
 
     lines.extend(["", f"_Claims expire after {DECOMP_CLAIM_TIMEOUT // 60} minutes._"])
+
+    return [
+        TextContent(
+            type="text",
+            text="\n".join(lines),
+        )
+    ]
+
+
+async def handle_complete_function(arguments: dict[str, Any]) -> list[TextContent]:
+    """Handle decomp_complete_function tool."""
+    function_name = arguments["function_name"]
+    match_percent = arguments["match_percent"]
+    scratch_slug = arguments["scratch_slug"]
+    committed = arguments.get("committed", False)
+    notes = arguments.get("notes", "")
+
+    logger.info(f"Marking function as completed: {function_name} ({match_percent}%)")
+
+    # Load and update completed functions
+    completed = _load_completed()
+    completed[function_name] = {
+        "match_percent": match_percent,
+        "scratch_slug": scratch_slug,
+        "committed": committed,
+        "notes": notes,
+        "timestamp": time.time(),
+    }
+    _save_completed(completed)
+
+    # Also release any claim on this function
+    claims_path = Path(DECOMP_CLAIMS_FILE)
+    if claims_path.exists():
+        lock_path = Path(str(claims_path) + ".lock")
+        lock_path.touch(exist_ok=True)
+        with open(lock_path, 'r') as lock_file:
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                claims = _load_claims()
+                if function_name in claims:
+                    del claims[function_name]
+                    _save_claims(claims)
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+    # Format response
+    status = "✅ Committed" if committed else "📝 Recorded"
+    lines = [
+        f"# Function Completed",
+        f"",
+        f"**Function:** `{function_name}`",
+        f"**Match:** {match_percent:.1f}%",
+        f"**Scratch:** {scratch_slug}",
+        f"**Status:** {status}",
+    ]
+    if notes:
+        lines.append(f"**Notes:** {notes}")
+
+    lines.extend([
+        f"",
+        f"This function is now marked as completed and won't be picked by other agents.",
+    ])
+
+    return [
+        TextContent(
+            type="text",
+            text="\n".join(lines),
+        )
+    ]
+
+
+async def handle_list_completed(arguments: dict[str, Any]) -> list[TextContent]:
+    """Handle decomp_list_completed tool."""
+    min_match = arguments.get("min_match", 0)
+
+    logger.info(f"Listing completed functions (min_match={min_match})")
+
+    completed = _load_completed()
+
+    if not completed:
+        return [
+            TextContent(
+                type="text",
+                text="No functions have been completed yet.",
+            )
+        ]
+
+    # Filter by min_match
+    filtered = {
+        name: info for name, info in completed.items()
+        if info.get("match_percent", 0) >= min_match
+    }
+
+    if not filtered:
+        return [
+            TextContent(
+                type="text",
+                text=f"No functions with ≥{min_match}% match found.",
+            )
+        ]
+
+    lines = [f"# Completed Functions ({len(filtered)} total)", ""]
+
+    # Sort by match percent descending
+    sorted_funcs = sorted(
+        filtered.items(),
+        key=lambda x: x[1].get("match_percent", 0),
+        reverse=True
+    )
+
+    for func_name, info in sorted_funcs:
+        match_pct = info.get("match_percent", 0)
+        scratch = info.get("scratch_slug", "?")
+        committed = "✅" if info.get("committed") else "📝"
+        notes = info.get("notes", "")
+
+        line = f"- {committed} **{func_name}** - {match_pct:.1f}% ([{scratch}](http://decomp.me/scratch/{scratch}))"
+        if notes:
+            line += f" - _{notes}_"
+        lines.append(line)
 
     return [
         TextContent(
