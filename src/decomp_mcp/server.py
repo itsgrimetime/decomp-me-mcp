@@ -41,12 +41,44 @@ DECOMP_COMPLETED_FILE = os.environ.get("DECOMP_COMPLETED_FILE", "/tmp/decomp_com
 # Claim timeout in seconds (auto-release stale claims)
 DECOMP_CLAIM_TIMEOUT = int(os.environ.get("DECOMP_CLAIM_TIMEOUT", "3600"))  # 1 hour default
 
-# Cloudflare clearance and session cookies for public API access
-CF_CLEARANCE = os.environ.get("CF_CLEARANCE", "") or "TuhG_e5O_SNg0u7gB3.WowMJp8WODm7AWnBvQra9mew-1766425348-1.2.1.1-whMulmtdFo0QkR1_o6ehURXoQrKQWY247ovfu3_Ta3zAcFzYowfrOwxRaV9fZXGfZiSdB8o07bMQ9eitcQIVn2Mpvk7z6Z8rkFOgOi247yENLAdf2Swq2m2cu1qzRREsmE6hXNJhDRIwQ3d9f8WIZ4nJV7GRCyQ1DcJPCzNafAl8K4bVKuLFIX9iM074xW3wjF.qJd7OyDI3H8jk7IwyyREpIduJCRm2DLNNpMkBY1k"
-SESSION_ID = os.environ.get("DECOMP_SESSION_ID", "") or "1b80qta9in20bb8bt2hklgwzgd5dn56s"
+# Cloudflare clearance for public API access (not needed for local)
+CF_CLEARANCE = os.environ.get("CF_CLEARANCE", "")
+
+# Path to persistent session cookies file
+DECOMP_COOKIES_FILE = os.environ.get("DECOMP_COOKIES_FILE", "/tmp/decomp_cookies.json")
 
 # Create server instance
 app = Server("decomp-mcp-server")
+
+
+def _load_cookies() -> dict[str, str]:
+    """Load persistent cookies from file."""
+    cookies_path = Path(DECOMP_COOKIES_FILE)
+    if not cookies_path.exists():
+        return {}
+    try:
+        with open(cookies_path, 'r') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def _save_cookies(cookies: dict[str, str]) -> None:
+    """Save cookies to persistent file."""
+    cookies_path = Path(DECOMP_COOKIES_FILE)
+    cookies_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cookies_path, 'w') as f:
+        json.dump(cookies, f, indent=2)
+
+
+def _update_cookies_from_response(response: httpx.Response) -> None:
+    """Extract and save cookies from response."""
+    cookies = _load_cookies()
+    for name, value in response.cookies.items():
+        cookies[name] = value
+        logger.info(f"Saved cookie: {name}={value[:20]}...")
+    if response.cookies:
+        _save_cookies(cookies)
 
 
 def extract_slug_from_url(url_or_slug: str) -> str:
@@ -440,12 +472,10 @@ async def list_tools() -> list[Tool]:
 
 
 def get_client_cookies() -> dict[str, str]:
-    """Get cookies for API requests."""
-    cookies = {}
+    """Get cookies for API requests (including persistent session cookies)."""
+    cookies = _load_cookies()
     if CF_CLEARANCE:
         cookies["cf_clearance"] = CF_CLEARANCE
-    if SESSION_ID:
-        cookies["sessionid"] = SESSION_ID
     return cookies
 
 
@@ -503,6 +533,7 @@ async def handle_get_scratch(client: httpx.AsyncClient, arguments: dict[str, Any
 
     response = await client.get(f"{DECOMP_API_BASE}/scratch/{slug}")
     response.raise_for_status()
+    _update_cookies_from_response(response)
 
     scratch = response.json()
     formatted = format_scratch_info(scratch)
@@ -544,6 +575,7 @@ async def handle_compile(client: httpx.AsyncClient, arguments: dict[str, Any]) -
         headers={"Content-Type": "application/json"},
     )
     compile_response.raise_for_status()
+    _update_cookies_from_response(compile_response)
 
     result = compile_response.json()
 
@@ -629,6 +661,7 @@ async def handle_search(client: httpx.AsyncClient, arguments: dict[str, Any]) ->
     logger.info(f"Searching with params: {params}")
     response = await client.get(f"{DECOMP_API_BASE}/search", params=params)
     response.raise_for_status()
+    _update_cookies_from_response(response)
 
     results = response.json()
 
@@ -764,6 +797,7 @@ async def handle_search_context(client: httpx.AsyncClient, arguments: dict[str, 
     # Fetch the scratch to get the context
     response = await client.get(f"{DECOMP_API_BASE}/scratch/{slug}")
     response.raise_for_status()
+    _update_cookies_from_response(response)
     scratch = response.json()
 
     context = scratch.get("context", "")
@@ -859,31 +893,18 @@ async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, 
 
     logger.info(f"Updating scratch: {slug}")
 
-    # Check if we have a claim token for this scratch
-    claim_token = _get_scratch_token(slug)
-    logger.info(f"Loaded claim token for {slug}: {claim_token[:20] if claim_token else 'None'}...")
-
-    # Log all saved tokens for debugging
-    all_tokens = _load_scratch_tokens()
-    logger.info(f"All saved scratch tokens: {list(all_tokens.keys())}")
-
     # PATCH the scratch with new source code
+    # The session cookies loaded from get_client_cookies() establish ownership
     payload = {"source_code": source_code}
-
-    # Add claim token as cookie if we have one
-    cookies = {}
-    if claim_token:
-        cookies[f"scratch_{slug}"] = claim_token
-        logger.info(f"Adding cookie scratch_{slug} for update")
 
     try:
         response = await client.patch(
             f"{DECOMP_API_BASE}/scratch/{slug}",
             json=payload,
             headers={"Content-Type": "application/json"},
-            cookies=cookies,
         )
         response.raise_for_status()
+        _update_cookies_from_response(response)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 403:
             return [
@@ -901,7 +922,7 @@ async def handle_update_scratch(client: httpx.AsyncClient, arguments: dict[str, 
         f"# Scratch Updated",
         f"",
         f"**Slug:** {slug}",
-        f"**URL:** https://decomp.me/scratch/{slug}",
+        f"**URL:** {DECOMP_API_BASE.replace('/api', '')}/scratch/{slug}",
         f"",
         f"Source code has been saved to decomp.me.",
     ]
@@ -974,28 +995,54 @@ async def handle_create_scratch(client: httpx.AsyncClient, arguments: dict[str, 
     )
     response.raise_for_status()
 
+    # Save any session cookies from the response for future requests
+    _update_cookies_from_response(response)
+
     result = response.json()
     slug = result.get("slug", "unknown")
 
     # Log the full response for debugging
     logger.info(f"Create scratch response keys: {list(result.keys())}")
 
-    # Save the claim token so we can update this scratch later
-    # decomp.me may return it as "claim_token" or include it in headers
+    # Get the claim token from the response
     claim_token = result.get("claim_token") or result.get("token")
+    claimed = False
+
     if claim_token:
         _save_scratch_token(slug, claim_token)
         logger.info(f"Saved claim token for scratch {slug}: {claim_token[:20]}...")
+
+        # Immediately claim the scratch to establish ownership
+        # This uses the same session (client), so we get the same profile
+        try:
+            claim_response = await client.post(
+                f"{DECOMP_API_BASE}/scratch/{slug}/claim",
+                json={"token": claim_token},
+                headers={"Content-Type": "application/json"},
+            )
+            claim_response.raise_for_status()
+            _update_cookies_from_response(claim_response)
+
+            claim_result = claim_response.json()
+            if claim_result.get("success"):
+                logger.info(f"Successfully claimed scratch {slug}")
+                claimed = True
+            else:
+                logger.warning(f"Claim returned success=false for scratch {slug}")
+        except Exception as e:
+            logger.warning(f"Could not claim scratch {slug}: {e}")
     else:
         logger.warning(f"No claim token in response for scratch {slug}")
 
     # Format the response
+    claim_status = "✅ Owned by you" if claimed else "⚠️ Not claimed (may not be updateable)"
     lines = [
         f"# Scratch Created",
         f"",
         f"**Name:** {name}",
         f"**Slug:** {slug}",
         f"**URL:** {DECOMP_API_BASE.replace('/api', '')}/scratch/{slug}",
+        f"**Ownership:** {claim_status}",
         f"",
         f"The scratch is ready for compilation. Use `decomp_compile` with slug `{slug}` to test your code.",
     ]
