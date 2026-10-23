@@ -223,9 +223,17 @@ Load scratch ABC123 and explain why the assembly doesn't match
 
 ### Running Tests
 
+The unit tests run offline against mocked decomp.me API responses:
+
 ```bash
 cd decomp-mcp-server
-source .venv/bin/activate
+uv pip install -e ".[dev]"
+pytest
+```
+
+`test_server.py` is a separate smoke test that calls the live decomp.me API:
+
+```bash
 python test_server.py
 ```
 
@@ -237,8 +245,9 @@ decomp-mcp-server/
 │   └── decomp_mcp/
 │       ├── __init__.py
 │       └── server.py          # Main MCP server implementation
+├── tests/                     # Offline unit tests (mocked API)
 ├── pyproject.toml             # Project dependencies and metadata
-├── test_server.py            # API integration tests
+├── test_server.py            # Live API smoke test
 └── README.md                 # This file
 ```
 
